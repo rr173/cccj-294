@@ -18,10 +18,11 @@ python3 -m venv .venv
 .venv/bin/pip install fastapi "uvicorn[standard]" pytest httpx
 
 .venv/bin/uvicorn app.asgi:app --port 8000        # TOURNAMENT_DB=/path/to.db
-.venv/bin/python -m pytest -q                     # 60 tests
+.venv/bin/python -m pytest -q                     # 69 tests
 ./demo/run_demo.sh                                # appeal/curl walkthrough
 ./demo/scheduling_demo.sh                         # booking/closure/start curl story
 ./demo/settlement_demo.sh                         # payment/readjudication/recovery story
+./demo/admission_demo.sh                          # offline gate permit + reschedule conflict
 ```
 
 `demo/run_demo.sh` starts its own uvicorn on a throwaway database, drives the
@@ -161,6 +162,71 @@ behavior.
 `TOURNAMENT_NOW=YYYY-MM-DDTHH:MM:SS+00:00` can pin the clock for tests and the
 reproducible demo; leave it unset in normal operation.
 
+## Spectator admission and offline gates
+
+Admission is modeled per reserved bracket slot (“轮位”) and applies to that
+slot's first/current booked occurrence.  Tickets follow the slot, not an old
+schedule row: after a reschedule, an unused code is accepted only at the
+current venue/interval unless an unsettled offline permit pins the old one.
+
+The capacity invariant is:
+
+```text
+confirmed admissions
++ release_limit of every unsettled offline permit
+<= fixed slot capacity
+```
+
+Merely issuing tickets does **not** reserve capacity.  A permit may list more
+codes than its `release_limit`; all listed codes are locked, while only
+`release_limit` places are reserved.
+
+Canonical HTTP endpoints (plus common `/permits`, `/entry-codes`, `/check-in`,
+camelCase and action-path aliases):
+
+| method & path | purpose |
+| --- | --- |
+| `PUT /tournaments/{id}/slots/{slot}/admission-capacity` | set/update the fixed cumulative cap; cannot lower it below committed entries+reservations |
+| `POST /tournaments/{id}/slots/{slot}/tickets` | issue generated codes or explicit `codes`; issuance never checks remaining capacity |
+| `GET /tournaments/{id}/slots/{slot}/admission` | confirmed entries, outstanding permit reservations, remaining allocatable capacity, tickets/permits/admissions |
+| `POST /tickets/{code}/revoke` | revoke an unused code; blocked while it is listed on an unsettled permit |
+| `POST /gates/{gate_id}/verify` | online one-code admission; checks current venue and half-open UTC window `[starts_at, ends_at)` |
+| `POST /tournaments/{id}/slots/{slot}/offline-permits` | claim a gate permit from `ticket_codes` and `release_limit` |
+| `GET /offline-permits/{permit_id}` | permit state; `expired` is informational and never means settled |
+| `POST /offline-permits/{permit_id}/settle` | submit the complete offline record, including `records: []` |
+| `POST /offline-permits/{permit_id}/terminate` | optional marker that local gate use has stopped; this does **not** settle or release capacity |
+| `GET /offline-settlements/{receipt_id}` or `GET /receipts/{Idempotency-Key}` | retrieve the original receipt |
+
+All admission writers use SQLite `BEGIN IMMEDIATE`.  Settlement validates the
+gate, every code's membership in the permit, duplicate codes in the report,
+`len(records) <= release_limit`, capacity, and each record's timestamp against
+the original permit window.  Any validation failure rolls the whole report
+back.  A correct report can be settled after the window has ended.  Settlement
+turns only reported codes into confirmed admissions, marks unreported listed
+codes unused/free, and removes the permit's full reservation.  Service restart,
+window expiry or a lost response never automatically settles a permit; retry
+with the same `Idempotency-Key`/`report_id` returns the original receipt, and
+different records get `409 settlement_conflict` / `idempotency_conflict`.
+
+`app/gate.py` provides `GateTerminal`, a durable SQLite gate state, and
+`HttpTransport`.  It admits one code per call, rejects local duplicates and
+over-limit use, survives `GateTerminal(path)` restart, durably terminates a
+permit before network submission, and retries one stable report key after a
+timeout.  `python -m app.gate --state gate.db ...` is a small CLI.
+
+Every `active`/unsettled permit contributes a pinned scheduling variable in
+`scheduling.build_repair_variables`.  Thus closure repair keeps its exact
+venue/date/start/end; the rest of the arrangement still uses the original
+minimum-change lexical solver.  If the new closure makes that pin infeasible,
+the closure insert and plan update roll back together.
+
+`python demo/admission_demo.py` (or `./demo/admission_demo.sh`) is a
+self-checking repeatable story: a permit blocks closure/rescheduling, an empty
+report allows the normal repair, a second permit snapshots the new schedule,
+the durable gate admits/offline-restarts/rejects a duplicate, settlement
+releases the unused reserved place, and the same unused code is rejected at the
+old venue and accepted at the new one.
+
 ## Appeal semantics
 
 * Filing an appeal requires the bout's current effective `result_version_id`;
@@ -284,6 +350,10 @@ tests/test_settlement.py    prize/fund limits, commitments, late bank
                             confirmation, receipt uniqueness, recovery,
                             suspension/final invalidation, restart and
                             concurrent payment/recovery/receipt/appeal races
+tests/test_admissions.py    capacity, one-time codes, online venue/time checks,
+                            permit locks/reservations, durable offline gate,
+                            atomic/late/idempotent settlement, schedule pins,
+                            restart/timeout and concurrency races
 ```
 
 The demo script prints, at each stage, the champion status and per-slot

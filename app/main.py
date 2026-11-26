@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, Header, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from . import scheduling, service, settlement
+from . import admissions, scheduling, service, settlement
 from .db import connect, init_db
 
 
@@ -206,6 +206,18 @@ def create_app(db_path: str | Path) -> FastAPI:
     )
     app.add_api_route(
         "/venues/{venue_hint}/closure",
+        create_closure_route,
+        methods=["POST", "PUT"],
+        status_code=201,
+    )
+    app.add_api_route(
+        "/venues/{venue_hint}/close",
+        create_closure_route,
+        methods=["POST", "PUT"],
+        status_code=201,
+    )
+    app.add_api_route(
+        "/venues/{venue_hint}/closures/new",
         create_closure_route,
         methods=["POST", "PUT"],
         status_code=201,
@@ -761,5 +773,7 @@ def create_app(db_path: str | Path) -> FastAPI:
             conn, int(tournament_id), data, idempotency_key
         )
         return _ok(payload, status_code=status)
+
+    app.include_router(admissions.router)
 
     return app

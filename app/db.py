@@ -318,6 +318,173 @@ CREATE INDEX IF NOT EXISTS ix_payment_recoveries_tournament
     ON payment_recoveries (tournament_id, id);
 CREATE INDEX IF NOT EXISTS ix_payment_recoveries_player
     ON payment_recoveries (tournament_id, player_id);
+
+-- -------------------------------------------------------------------------
+-- Spectator admission and offline gate permits.
+--
+-- Tickets do not reserve capacity merely by existing.  Confirmed admissions
+-- and the full release_limit of every unsettled offline permit are the two
+-- committed quantities checked against admission_capacities.capacity.
+-- -------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS admission_capacities (
+    tournament_id INTEGER NOT NULL
+        REFERENCES tournaments(id) ON DELETE CASCADE,
+    slot_id TEXT NOT NULL,
+    capacity INTEGER NOT NULL CHECK (capacity >= 0),
+    set_by TEXT,
+    updated_by TEXT,
+    idempotency_key TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (tournament_id, slot_id)
+);
+
+CREATE TABLE IF NOT EXISTS gates (
+    gate_id TEXT PRIMARY KEY,
+    venue_name TEXT NOT NULL,
+    name TEXT,
+    registered_by TEXT,
+    idempotency_key TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS admission_tickets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tournament_id INTEGER NOT NULL
+        REFERENCES tournaments(id) ON DELETE CASCADE,
+    slot_id TEXT NOT NULL,
+    code TEXT NOT NULL,
+    holder_name TEXT,
+    status TEXT NOT NULL DEFAULT 'unused'
+        CHECK (status IN ('unused', 'used', 'revoked')),
+    offline_permit_id INTEGER,
+    issued_by TEXT,
+    revoked_by TEXT,
+    revoke_reason TEXT,
+    idempotency_key TEXT,
+    issued_at TEXT NOT NULL,
+    revoked_at TEXT,
+    used_at TEXT,
+    admission_id INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (tournament_id, code)
+);
+
+CREATE INDEX IF NOT EXISTS ix_admission_tickets_lookup
+    ON admission_tickets (tournament_id, slot_id, code);
+CREATE INDEX IF NOT EXISTS ix_admission_tickets_status
+    ON admission_tickets (tournament_id, slot_id, status);
+CREATE INDEX IF NOT EXISTS ix_admission_tickets_permit
+    ON admission_tickets (offline_permit_id);
+
+CREATE TABLE IF NOT EXISTS offline_permits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    permit_code TEXT NOT NULL UNIQUE,
+    tournament_id INTEGER NOT NULL
+        REFERENCES tournaments(id) ON DELETE CASCADE,
+    slot_id TEXT NOT NULL,
+    gate_id TEXT NOT NULL,
+    venue_name TEXT NOT NULL,
+    schedule_date TEXT NOT NULL,
+    start_minute INTEGER NOT NULL,
+    end_minute INTEGER NOT NULL,
+    starts_at TEXT NOT NULL,
+    ends_at TEXT NOT NULL,
+    release_limit INTEGER NOT NULL CHECK (release_limit >= 0),
+    listed_code_count INTEGER NOT NULL CHECK (listed_code_count >= 0),
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'settled')),
+    requested_by TEXT,
+    idempotency_key TEXT,
+    request_json TEXT NOT NULL DEFAULT '{}',
+    request_hash TEXT,
+    report_id TEXT,
+    settlement_key TEXT,
+    actual_admitted_count INTEGER NOT NULL DEFAULT 0,
+    released_code_count INTEGER NOT NULL DEFAULT 0,
+    settlement_request_hash TEXT,
+    settlement_response_json TEXT,
+    terminate_requested_at TEXT,
+    created_at TEXT NOT NULL,
+    settled_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS ix_offline_permits_lookup
+    ON offline_permits (tournament_id, slot_id, status);
+CREATE INDEX IF NOT EXISTS ix_offline_permits_gate
+    ON offline_permits (gate_id, status);
+CREATE INDEX IF NOT EXISTS ix_offline_permits_schedule
+    ON offline_permits (tournament_id, slot_id, starts_at, ends_at);
+
+CREATE TABLE IF NOT EXISTS offline_permit_tickets (
+    permit_id INTEGER NOT NULL
+        REFERENCES offline_permits(id) ON DELETE CASCADE,
+    ticket_id INTEGER NOT NULL
+        REFERENCES admission_tickets(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'reserved'
+        CHECK (status IN ('reserved', 'used', 'released')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (permit_id, ticket_id)
+);
+
+-- At most one unsettled permit may hold a ticket.  Once settled, rows become
+-- used/released and a later permit may reserve the same unused code.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_offline_permit_active_ticket
+    ON offline_permit_tickets (ticket_id)
+    WHERE status = 'reserved';
+
+CREATE TABLE IF NOT EXISTS admissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tournament_id INTEGER NOT NULL
+        REFERENCES tournaments(id) ON DELETE CASCADE,
+    slot_id TEXT NOT NULL,
+    ticket_id INTEGER NOT NULL UNIQUE
+        REFERENCES admission_tickets(id),
+    ticket_code TEXT NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('online', 'offline')),
+    status TEXT NOT NULL DEFAULT 'admitted',
+    gate_id TEXT,
+    venue_name TEXT NOT NULL,
+    admitted_at TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    permit_id INTEGER REFERENCES offline_permits(id),
+    settlement_id INTEGER,
+    idempotency_key TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_admissions_slot
+    ON admissions (tournament_id, slot_id, admitted_at);
+CREATE INDEX IF NOT EXISTS ix_admissions_permit
+    ON admissions (permit_id);
+CREATE INDEX IF NOT EXISTS ix_admissions_gate
+    ON admissions (gate_id);
+
+CREATE TABLE IF NOT EXISTS offline_settlements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    permit_id INTEGER NOT NULL UNIQUE
+        REFERENCES offline_permits(id),
+    report_id TEXT UNIQUE,
+    tournament_id INTEGER NOT NULL,
+    slot_id TEXT NOT NULL,
+    gate_id TEXT NOT NULL,
+    record_count INTEGER NOT NULL,
+    admitted_count INTEGER NOT NULL,
+    released_count INTEGER NOT NULL,
+    request_hash TEXT NOT NULL,
+    idempotency_key TEXT,
+    request_json TEXT NOT NULL DEFAULT '{}',
+    response_json TEXT NOT NULL DEFAULT '{}',
+    submitted_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_offline_settlements_report
+    ON offline_settlements (report_id);
 """
 
 

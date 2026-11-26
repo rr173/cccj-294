@@ -480,6 +480,7 @@ class Variable:
     slot_id: str
     choices: list[Choice]
     locked: bool
+    lock_reason: str | None = None
 
     @property
     def key(self) -> tuple[int, str]:
@@ -776,9 +777,16 @@ def _prepare_variables(
                     raise _error(
                         409,
                         "closure_conflicts_with_locked_slot",
-                        "A closure overlaps a slot that has started or reached its start time",
+                        (
+                            "A closure overlaps a slot pinned by an unsettled "
+                            "offline permit"
+                            if var.lock_reason == "offline_permit"
+                            else "A closure overlaps a slot that has started or reached its start time"
+                        ),
                         tournament_id=choice.tournament_id,
                         slot_id=choice.slot_id,
+                        lock_reason=var.lock_reason,
+                        pinned_by_offline_permit=var.lock_reason == "offline_permit",
                         closure={
                             "venue": closure.venue,
                             "date": closure.day,
@@ -1220,6 +1228,18 @@ def build_repair_variables(
 ) -> list[Variable]:
     reservation_rows = conn.execute("SELECT tournament_id FROM schedule_reservations").fetchall()
     variables: list[Variable] = []
+    # Every unsettled offline permit pins its exact claimed venue/interval.
+    # The closure solver therefore cannot repair a closure by moving that slot;
+    # if the new closure overlaps the pinned interval, solving fails and the
+    # closure transaction rolls back.
+    permitted_rows = conn.execute(
+        """
+        SELECT DISTINCT tournament_id, slot_id
+        FROM offline_permits
+        WHERE status = 'active'
+        """
+    ).fetchall()
+    pinned_slots = {(int(r["tournament_id"]), r["slot_id"]) for r in permitted_rows}
     for reservation in reservation_rows:
         tid = int(reservation["tournament_id"])
         used_slots = {
@@ -1252,7 +1272,17 @@ def build_repair_variables(
                 old_row["venue_name"],
             )
             old_start = datetime.fromisoformat(old_row["starts_at"])
-            locked = slot in used_slots or old_start <= now
+            pinned_by_permit = (tid, slot) in pinned_slots
+            time_locked = old_start <= now
+            locked = slot in used_slots or time_locked or pinned_by_permit
+            if pinned_by_permit:
+                lock_reason = "offline_permit"
+            elif slot in used_slots:
+                lock_reason = "match_started"
+            elif time_locked:
+                lock_reason = "start_time_reached"
+            else:
+                lock_reason = None
             old_candidate = conn.execute(
                 "SELECT * FROM schedule_candidates WHERE id = ?",
                 (old_row["candidate_id"],),
@@ -1261,7 +1291,9 @@ def build_repair_variables(
                 if old_candidate is None:
                     raise _error(500, "candidate_missing", "Selected candidate no longer exists")
                 choice = _choice_from_candidate_row(old_candidate, old_tuple)
-                variables.append(Variable(tid, slot, [choice], locked=True))
+                variables.append(
+                    Variable(tid, slot, [choice], locked=True, lock_reason=lock_reason)
+                )
                 continue
 
             choices: list[Choice] = []
