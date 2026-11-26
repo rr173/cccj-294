@@ -18,14 +18,18 @@ python3 -m venv .venv
 .venv/bin/pip install fastapi "uvicorn[standard]" pytest httpx
 
 .venv/bin/uvicorn app.asgi:app --port 8000        # TOURNAMENT_DB=/path/to.db
-.venv/bin/python -m pytest -q                     # 46 tests
+.venv/bin/python -m pytest -q                     # 60 tests
 ./demo/run_demo.sh                                # appeal/curl walkthrough
 ./demo/scheduling_demo.sh                         # booking/closure/start curl story
+./demo/settlement_demo.sh                         # payment/readjudication/recovery story
 ```
 
 `demo/run_demo.sh` starts its own uvicorn on a throwaway database, drives the
 whole story with `curl`, restarts the process at the end, and prints the
-history. It needs `jq` and `curl` on the PATH.
+history. It needs `jq` and `curl` on the PATH. `demo/settlement_demo.sh` is a
+repeatable end-to-end finance example: it issues a payment, overturns the final,
+confirms the old payment after the decision, recovers the overpayment, pays the
+new champion, and restarts the service.
 
 ## Model
 
@@ -76,6 +80,12 @@ returns the original response; reusing it for a different operation/body is a
 | `POST /tournaments/{id}/slots/{slot}/appeals` | `{result_version_id, description, submitted_by}` on the **current** effective version |
 | `POST /tournaments/{id}/appeals/{aid}/adjudicate` | `{outcome: "upheld"\|"overturned", expected_result_version_id, adjudicated_by, note?}` |
 | `GET /tournaments/{id}/matches/{mid}` | one bout, current or historical |
+| `POST /tournaments/{id}/prize-settings` | set once: champion/runner-up fixed amounts in integer cents |
+| `POST /tournaments/{id}/funds` | add one positive prize-fund contribution for this tournament |
+| `GET /tournaments/{id}/settlement` | funds, player balances, payment orders, recoveries and ledger |
+| `POST /tournaments/{id}/payments` | issue a payment against the seen effective final result version |
+| `POST /payments/{pid}/confirm` | register bank `success`/`failed`; success needs a unique receipt |
+| `POST /tournaments/{id}/recoveries` | register an actual partial/full clawback against the current version |
 | `POST /tournaments/{id}/reservations` | submit ≤6 candidates for all seven slots and confirm one booking |
 | `GET /tournaments/{id}/schedule` | candidates plus current selected arrangement |
 | `POST /closures` or `POST /venues/{venue}/closures` | register a future closure and atomically re-plan |
@@ -181,6 +191,82 @@ reproducible demo; leave it unset in normal operation.
   decision for the *same* appeal and base version returns the original
   response unchanged (no new version row).
 
+## Prize settlement
+
+All money fields are non-negative **integer minor units** (`*_cents`; use fen
+for CNY). Prize amounts are configured once per tournament; fund additions are
+tournament rows and every balance query is filtered by `tournament_id`, so one
+event can never spend another event's money. New settlement tables are created
+by `init_db`, so old SQLite tournament files keep working and gain the finance
+tables on restart.
+
+The settlement state is derived from the same bracket/appeal rules:
+
+* `decided` — the current final is complete and no pending appeal blocks the
+  champion. Its result-version winner and loser receive the fixed champion and
+  runner-up amounts.
+* `suspended` — a pending appeal blocks champion declaration, or an upstream
+  overturn superseded/invalidated the final. New payments and recoveries are
+  rejected with `409 settlement_suspended`; existing orders can still be
+  confirmed by staff.
+* `awaiting_final` — the final has not produced an effective result yet.
+
+A payment order snapshots `player_id`, `amount_cents`, `final_match_id`,
+`result_version_id`, award role and award amount. Readjudication never updates
+those fields. New issuance is limited by both:
+
+```text
+player capacity = current_prize_amount
+                  - net_paid_cents
+                  - unconfirmed_payment_cents
+tournament available_funds_cents = funding_total + actual_recoveries
+                                   - successful_payments
+                                   - pending_payments
+```
+
+`net_paid_cents = successful_payments - actual_recoveries`. A failed bank
+result is the only thing that releases that order's pending encumbrance; a
+pending order keeps reserving funds because it may still succeed. Success posts
+real money out and stores the bank receipt. A successful receipt has a partial
+unique index, so it cannot be attached to a second payment. Repeating the same
+idempotent confirmation returns the stored response; reusing the key with a
+different request returns `409 idempotency_conflict`.
+
+When settlement is `decided`, `pending_recovery_cents` is
+`max(0, net_paid_cents - current_prize_amount_cents)`. A player no longer on
+the final has current prize zero. Recoveries are actual receipts (partial
+recovery is allowed) and immediately become available tournament funds. During
+`suspended`, prize and recovery amounts are explicitly `null`; factual paid,
+pending and payment-history fields remain visible, so suspension is not treated
+as a universal refund order.
+
+`GET /tournaments/{id}/settlement` returns:
+
+* `prize_pool` with funding, cash balance, pending commitments and
+  `available_funds_cents`;
+* `players[]` with current prize, net paid, unconfirmed payments and pending
+  recovery;
+* `payments[]`, `recoveries[]` and `funding_additions[]`;
+* `fund_movements[]`, including commitment events and real cash events;
+* `award_versions[]` and non-cash `award_differences[]` for readjudication
+  effects.
+
+Canonical write bodies are:
+
+```json
+{"champion_amount_cents": 10000, "runner_up_amount_cents": 5000}
+{"amount_cents": 3000, "source": "sponsor"}
+{"player_id": 12, "amount_cents": 2000, "result_version_id": 8}
+{"status": "success", "bank_receipt_number": "BANK-123"}
+{"player_id": 12, "amount_cents": 5000, "result_version_id": 8}
+```
+
+Common path/field aliases (`/prizes`, `/funds`, `/clawbacks`,
+`/payments/{id}/bank-result`, `receipt_number`, etc.) are accepted. All finance
+writers use `BEGIN IMMEDIATE`; settlement reads use one SQLite snapshot, so
+concurrent issuance, recovery, bank confirmation and appeals cannot over-commit
+or return mixed versions.
+
 ## Verification
 
 ```
@@ -194,6 +280,10 @@ tests/test_robustness.py    replaced live bouts, races through HTTP, nested
                             overturn chains, durability
 tests/test_concurrency_db.py  independent connections: one result wins,
                             one of two opposite adjudications wins
+tests/test_settlement.py    prize/fund limits, commitments, late bank
+                            confirmation, receipt uniqueness, recovery,
+                            suspension/final invalidation, restart and
+                            concurrent payment/recovery/receipt/appeal races
 ```
 
 The demo script prints, at each stage, the champion status and per-slot

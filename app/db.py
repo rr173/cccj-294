@@ -224,6 +224,100 @@ CREATE TABLE IF NOT EXISTS match_venue_usages (
 
 CREATE INDEX IF NOT EXISTS ix_match_venue_usages_tournament
     ON match_venue_usages (tournament_id, slot_id);
+
+-- -------------------------------------------------------------------------
+-- Prize settlement and payment commitments.
+--
+-- Money amounts are always non-negative integer minor units (cents/fen).
+-- Rows here are financial facts; readjudication never rewrites a payment to
+-- a new recipient or amount.  The result version snapshot records what the
+-- finance query showed when the order was promised.
+-- -------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS prize_settings (
+    tournament_id INTEGER PRIMARY KEY
+        REFERENCES tournaments(id) ON DELETE CASCADE,
+    champion_amount_cents INTEGER NOT NULL
+        CHECK (champion_amount_cents >= 0),
+    runner_up_amount_cents INTEGER NOT NULL
+        CHECK (runner_up_amount_cents >= 0),
+    set_by TEXT NOT NULL,
+    idempotency_key TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS funding_additions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tournament_id INTEGER NOT NULL
+        REFERENCES tournaments(id) ON DELETE CASCADE,
+    amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+    source TEXT,
+    note TEXT,
+    funded_by TEXT,
+    idempotency_key TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_funding_additions_tournament
+    ON funding_additions (tournament_id, id);
+
+CREATE TABLE IF NOT EXISTS payment_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tournament_id INTEGER NOT NULL
+        REFERENCES tournaments(id) ON DELETE CASCADE,
+    player_id INTEGER NOT NULL REFERENCES players(id),
+    amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+    final_match_id INTEGER NOT NULL REFERENCES matches(id),
+    result_version_id INTEGER NOT NULL REFERENCES result_versions(id),
+    award_type TEXT NOT NULL CHECK (award_type IN ('champion', 'runner_up')),
+    award_amount_snapshot_cents INTEGER NOT NULL
+        CHECK (award_amount_snapshot_cents >= 0),
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'success', 'failed')),
+    bank_receipt_number TEXT,
+    bank_reference TEXT,
+    confirmed_by TEXT,
+    confirmation_note TEXT,
+    failure_reason TEXT,
+    created_by TEXT,
+    idempotency_key TEXT,
+    created_at TEXT NOT NULL,
+    confirmed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS ix_payment_orders_tournament
+    ON payment_orders (tournament_id, id);
+CREATE INDEX IF NOT EXISTS ix_payment_orders_player
+    ON payment_orders (tournament_id, player_id, status);
+CREATE INDEX IF NOT EXISTS ix_payment_orders_version
+    ON payment_orders (result_version_id);
+
+-- A successful bank receipt can prove only one payment.  The partial unique
+-- index is the final database-level guard even under racing writers.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_payment_orders_success_receipt
+    ON payment_orders (bank_receipt_number)
+    WHERE status = 'success' AND bank_receipt_number IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS payment_recoveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tournament_id INTEGER NOT NULL
+        REFERENCES tournaments(id) ON DELETE CASCADE,
+    player_id INTEGER NOT NULL REFERENCES players(id),
+    amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+    final_match_id INTEGER NOT NULL REFERENCES matches(id),
+    result_version_id INTEGER NOT NULL REFERENCES result_versions(id),
+    current_award_amount_snapshot_cents INTEGER NOT NULL
+        CHECK (current_award_amount_snapshot_cents >= 0),
+    received_by TEXT,
+    note TEXT,
+    idempotency_key TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_payment_recoveries_tournament
+    ON payment_recoveries (tournament_id, id);
+CREATE INDEX IF NOT EXISTS ix_payment_recoveries_player
+    ON payment_recoveries (tournament_id, player_id);
 """
 
 
