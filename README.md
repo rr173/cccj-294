@@ -3,8 +3,8 @@
 Python 3.11 · FastAPI · SQLite (WAL, `BEGIN IMMEDIATE` writers) · pytest.
 
 The bracket is fixed: seeds 1v8, 4v5 | 3v6, 2v7 in the quarterfinals, the
-winners meeting in SF1/SF2 and then the final. There are no draws, no
-scheduling and no UI.
+winners meeting in SF1/SF2 and then the final. There are no draws and no UI.
+Venue reservation and closure-aware rescheduling are provided over HTTP.
 
 The central design rule is that **a bout that actually happened is never
 renamed or deleted**. The bracket slot is a separate thing that points at a
@@ -18,8 +18,9 @@ python3 -m venv .venv
 .venv/bin/pip install fastapi "uvicorn[standard]" pytest httpx
 
 .venv/bin/uvicorn app.asgi:app --port 8000        # TOURNAMENT_DB=/path/to.db
-.venv/bin/python -m pytest -q                     # 30 tests
-./demo/run_demo.sh                                # curl walkthrough, self-hosted
+.venv/bin/python -m pytest -q                     # 46 tests
+./demo/run_demo.sh                                # appeal/curl walkthrough
+./demo/scheduling_demo.sh                         # booking/closure/start curl story
 ```
 
 `demo/run_demo.sh` starts its own uvicorn on a throwaway database, drives the
@@ -75,6 +76,12 @@ returns the original response; reusing it for a different operation/body is a
 | `POST /tournaments/{id}/slots/{slot}/appeals` | `{result_version_id, description, submitted_by}` on the **current** effective version |
 | `POST /tournaments/{id}/appeals/{aid}/adjudicate` | `{outcome: "upheld"\|"overturned", expected_result_version_id, adjudicated_by, note?}` |
 | `GET /tournaments/{id}/matches/{mid}` | one bout, current or historical |
+| `POST /tournaments/{id}/reservations` | submit ≤6 candidates for all seven slots and confirm one booking |
+| `GET /tournaments/{id}/schedule` | candidates plus current selected arrangement |
+| `POST /closures` or `POST /venues/{venue}/closures` | register a future closure and atomically re-plan |
+| `GET /schedule?date=YYYY-MM-DD` | closures and all tournaments' current arrangements for a UTC day |
+| `GET /venues/{venue}/schedule?date=...` | one venue's closures and assignments |
+| `GET /receipts/{Idempotency-Key}` | stored status/body of a successful idempotent write |
 | `GET /health` | liveness |
 
 Errors are `{"error": {"code": ..., "message": ..., ...}}`.
@@ -83,6 +90,66 @@ Key codes: `match_already_in_progress`, `match_already_completed`,
 `match_not_started`, `participants_not_ready`, `slot_suspended`,
 `result_version_changed`, `appeal_stale`, `appeal_already_decided`,
 `invalid_winner`, `idempotency_conflict`, `idempotency_key_required`.
+
+## Venue scheduling
+
+Candidates use UTC minute-of-day.  An interval is half-open:
+`[start_minute, end_minute)`, so one slot ending at minute 630 and a feeder
+or next slot starting at minute 630 are compatible.  A compact request is:
+
+```json
+{
+  "candidates": {
+    "QF1": [
+      {"venue_name": "A", "date": "2026-03-15", "start_minute": 540, "end_minute": 570},
+      {"venue_name": "B", "date": "2026-03-15", "start_minute": 540, "end_minute": 570}
+    ],
+    "QF2": ["..."], "QF3": ["..."], "QF4": ["..."],
+    "SF1": ["..."], "SF2": ["..."], "F": ["..."]
+  }
+}
+```
+
+The API also accepts a list of `{slot_id, options:[...]}` groups and common
+aliases such as `venue`, `court`, `start_time:"09:00"`, or full UTC
+`starts_at`/`ends_at` timestamps.  Send an `Idempotency-Key` header.
+
+Confirmation is one atomic transaction:
+
+* all seven slots must receive one feasible choice;
+* at most six candidates are stored per slot;
+* newly chosen starts must not be before server UTC time;
+* choices must not overlap a closure or another tournament's selected interval
+  at the same venue;
+* a slot may start only after every direct feeder's selected interval ends;
+* a first reservation treats every other tournament's arrangement as fixed;
+* expected search envelope: at most four tournaments on one UTC day.
+
+`POST /closures` accepts the same date/minute interval fields.  The solver
+searches changed-slot counts from zero upward.  At the minimum count it takes
+the first lexical DFS solution in `(tournament id, QF1..QF4, SF1, SF2, F)`
+order, trying each slot's `(start, end, venue_name)` tuple lexicographically;
+that is exactly the required global tie-break.  A selected slot is immutable
+after its start instant has arrived or after any bout has used it.  Movable
+slots can use only their own original candidates, including slots moved solely
+to resolve a new cross-tournament overlap or bracket cascade.  If no complete
+solution exists, the closure insert and tentative plan roll back.
+
+All reservation, closure and start transactions use `BEGIN IMMEDIATE`; day and
+history reads use one SQLite snapshot.  This prevents duplicate venue
+occupancy and torn schedule reads across concurrent HTTP workers.
+
+For a reserved tournament, the **first** start of each slot must satisfy the
+existing bracket/appeal rules and occur inside its confirmed interval.  The
+successful start writes an immutable `match_venue_usages` row; it appears in
+`GET /tournaments/{id}/history` as `venue_usage` / `actual_schedule` and is
+never updated by an appeal or adjudication.  An appeal replay creates attempt
+2 and is outside this first-booking window rule so staff can arrange that
+rematch separately.  Tournaments without a reservation keep the old start
+behavior.
+
+`TOURNAMENT_NOW=YYYY-MM-DDTHH:MM:SS+00:00` can pin the clock for tests and the
+reproducible demo; leave it unset in normal operation.
 
 ## Appeal semantics
 
@@ -118,6 +185,9 @@ Key codes: `match_already_in_progress`, `match_already_completed`,
 
 ```
 tests/test_bracket.py       seeds, start/result rules, idempotency, restart
+tests/test_scheduling.py    candidate validation, lexical solver, cross-event
+                            minimum closure repair, locks, idempotency/restart,
+                            scheduled first starts, immutable usage, DB races
 tests/test_appeals.py       suspend/uphold/overturn, history, untouched half,
                             version targeting, stale appeals, nested appeals
 tests/test_robustness.py    replaced live bouts, races through HTTP, nested

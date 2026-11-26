@@ -20,9 +20,11 @@ import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Iterable, Literal, Sequence
 
+from .clock import now_iso as clock_now_iso
+from .clock import utcnow
 from .db import read_tx, write_tx
 
 # ---------------------------------------------------------------------------
@@ -48,7 +50,7 @@ class TournamentError(Exception):
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    return clock_now_iso()
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +304,74 @@ def _version_view(
     }
 
 
+def _assignment_view(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {
+        "candidate_id": row["candidate_id"],
+        "tournament_id": row["tournament_id"],
+        "slot_id": row["slot_id"],
+        "venue": row["venue_name"],
+        "venue_name": row["venue_name"],
+        "court": row["venue_name"],
+        "facility": row["venue_name"],
+        "date": row["schedule_date"],
+        "start_minute": row["start_minute"],
+        "end_minute": row["end_minute"],
+        "start_minutes": row["start_minute"],
+        "end_minutes": row["end_minute"],
+        "start": f"{row['start_minute'] // 60:02d}:{row['start_minute'] % 60:02d}",
+        "end": f"{row['end_minute'] // 60:02d}:{row['end_minute'] % 60:02d}",
+        "start_time": f"{row['start_minute'] // 60:02d}:{row['start_minute'] % 60:02d}",
+        "end_time": f"{row['end_minute'] // 60:02d}:{row['end_minute'] % 60:02d}",
+        "starts_at": row["starts_at"],
+        "ends_at": row["ends_at"],
+        "start_at": row["starts_at"],
+        "end_at": row["ends_at"],
+        "revision": row["revision"],
+    }
+
+
+def _venue_usage_view(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    scheduled = None
+    if row["scheduled_starts_at"] is not None:
+        scheduled = {
+            "venue": row["venue_name"],
+            "venue_name": row["venue_name"],
+            "date": row["schedule_date"],
+            "start_minute": row["start_minute"],
+            "end_minute": row["end_minute"],
+            "starts_at": row["scheduled_starts_at"],
+            "ends_at": row["scheduled_ends_at"],
+        }
+    return {
+        "id": row["id"],
+        "match_id": row["match_id"],
+        "tournament_id": row["tournament_id"],
+        "slot_id": row["slot_id"],
+        "assignment_id": row["assignment_id"],
+        "venue": row["venue_name"],
+        "venue_name": row["venue_name"],
+        "court": row["venue_name"],
+        "date": row["schedule_date"],
+        "start_minute": row["start_minute"],
+        "end_minute": row["end_minute"],
+        "start_minutes": row["start_minute"],
+        "end_minutes": row["end_minute"],
+        "starts_at": row["scheduled_starts_at"],
+        "ends_at": row["scheduled_ends_at"],
+        "start_at": row["scheduled_starts_at"],
+        "end_at": row["scheduled_ends_at"],
+        "scheduled_slot": scheduled,
+        "scheduled": scheduled,
+        "actual_started_at": row["actual_started_at"],
+        "within_scheduled_window": bool(row["within_scheduled_window"]),
+        "schedule_controlled": bool(row["schedule_controlled"]),
+    }
+
+
 def _match_view(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -309,6 +379,10 @@ def _match_view(
 ) -> dict[str, Any]:
     versions = _versions(conn, row["id"])
     latest = versions[-1] if versions else None
+    usage_row = conn.execute(
+        "SELECT * FROM match_venue_usages WHERE match_id = ?", (row["id"],)
+    ).fetchone()
+    venue_usage = _venue_usage_view(usage_row)
     return {
         "id": row["id"],
         "slot_id": row["slot_id"],
@@ -321,6 +395,11 @@ def _match_view(
         },
         "started_at": row["started_at"],
         "started_by": row["started_by"],
+        "venue_usage": venue_usage,
+        "actual_schedule": venue_usage,
+        "venue": venue_usage["venue_name"] if venue_usage else None,
+        "venue_name": venue_usage["venue_name"] if venue_usage else None,
+        "schedule": venue_usage["scheduled"] if venue_usage else None,
         "completed_at": row["completed_at"],
         "completed_by": row["completed_by"],
         "result": _version_view(conn, latest, players) if latest else None,
@@ -370,6 +449,14 @@ def _slot_view(
     pending: Sequence[sqlite3.Row],
 ) -> dict[str, Any]:
     current = _current_match(conn, tournament_id, spec.slot_id)
+    assignment_row = conn.execute(
+        """
+        SELECT * FROM schedule_assignments
+        WHERE tournament_id = ? AND slot_id = ?
+        """,
+        (tournament_id, spec.slot_id),
+    ).fetchone()
+    assignment = _assignment_view(assignment_row)
     history_rows = list(
         conn.execute(
             """
@@ -449,6 +536,8 @@ def _slot_view(
         "slot_id": spec.slot_id,
         "round": spec.round_name,
         "round_index": spec.round_index,
+        "schedule": assignment,
+        "venue_schedule": assignment,
         "feeders": list(spec.feeders),
         "fixed_seeds": list(spec.seeds) if spec.seeds else None,
         "feeder_winners": feeder_winners,
@@ -880,6 +969,45 @@ def start_match(
         ).fetchone()
         attempt = int(row["max_attempt"]) + 1
         timestamp = now_iso()
+
+        # Only the first start of a bracket slot is required to use the
+        # confirmed venue slot.  A later attempt is an appeal replay that
+        # staff arrange outside this first-booking workflow.
+        scheduled_assignment = None
+        if attempt == 1:
+            scheduled_assignment = conn.execute(
+                """
+                SELECT * FROM schedule_assignments
+                WHERE tournament_id = ? AND slot_id = ?
+                """,
+                (tournament_id, slot_id),
+            ).fetchone()
+            if scheduled_assignment is not None:
+                window_start = datetime.fromisoformat(
+                    scheduled_assignment["starts_at"]
+                )
+                window_end = datetime.fromisoformat(
+                    scheduled_assignment["ends_at"]
+                )
+                current_time = utcnow()
+                if not (window_start <= current_time < window_end):
+                    raise TournamentError(
+                        409,
+                        "outside_scheduled_slot",
+                        "The first bout in this reserved slot must start "
+                        "during its confirmed [start, end) interval",
+                        current_time=current_time.isoformat(),
+                        scheduled_slot={
+                            "venue": scheduled_assignment["venue_name"],
+                            "venue_name": scheduled_assignment["venue_name"],
+                            "date": scheduled_assignment["schedule_date"],
+                            "start_minute": scheduled_assignment["start_minute"],
+                            "end_minute": scheduled_assignment["end_minute"],
+                            "starts_at": scheduled_assignment["starts_at"],
+                            "ends_at": scheduled_assignment["ends_at"],
+                        },
+                    )
+
         cur = conn.execute(
             """
             INSERT INTO matches
@@ -901,6 +1029,32 @@ def start_match(
             ),
         )
         match_id = int(cur.lastrowid)
+        if scheduled_assignment is not None:
+            conn.execute(
+                """
+                INSERT INTO match_venue_usages
+                    (match_id, tournament_id, slot_id, assignment_id,
+                     venue_name, schedule_date, start_minute, end_minute,
+                     scheduled_starts_at, scheduled_ends_at,
+                     actual_started_at, within_scheduled_window,
+                     schedule_controlled, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?)
+                """,
+                (
+                    match_id,
+                    tournament_id,
+                    slot_id,
+                    scheduled_assignment["id"],
+                    scheduled_assignment["venue_name"],
+                    scheduled_assignment["schedule_date"],
+                    scheduled_assignment["start_minute"],
+                    scheduled_assignment["end_minute"],
+                    scheduled_assignment["starts_at"],
+                    scheduled_assignment["ends_at"],
+                    timestamp,
+                    timestamp,
+                ),
+            )
         match = _match_by_id(conn, match_id)
         players = _players_by_id(conn, tournament_id)
         assert match is not None
