@@ -1,0 +1,131 @@
+# Eight-player single-elimination tournament service
+
+Python 3.11 · FastAPI · SQLite (WAL, `BEGIN IMMEDIATE` writers) · pytest.
+
+The bracket is fixed: seeds 1v8, 4v5 | 3v6, 2v7 in the quarterfinals, the
+winners meeting in SF1/SF2 and then the final. There are no draws, no
+scheduling and no UI.
+
+The central design rule is that **a bout that actually happened is never
+renamed or deleted**. The bracket slot is a separate thing that points at a
+*current* bout; an appeal that changes an upstream result can retire a
+downstream bout into history and leave the slot waiting for a fresh pair.
+
+## Run
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install fastapi "uvicorn[standard]" pytest httpx
+
+.venv/bin/uvicorn app.asgi:app --port 8000        # TOURNAMENT_DB=/path/to.db
+.venv/bin/python -m pytest -q                     # 30 tests
+./demo/run_demo.sh                                # curl walkthrough, self-hosted
+```
+
+`demo/run_demo.sh` starts its own uvicorn on a throwaway database, drives the
+whole story with `curl`, restarts the process at the end, and prints the
+history. It needs `jq` and `curl` on the PATH.
+
+## Model
+
+| concept | meaning |
+| --- | --- |
+| slot | one bracket position: `QF1..QF4`, `SF1`, `SF2`, `F` |
+| match (bout) | something staff actually started; participants are locked at start; never mutated, never deleted |
+| result version | immutable result rows of a bout; version 1 is staff-reported, later versions come only from adjudications |
+| appeal | targets one specific result version; `pending` → `upheld` / `overturned` / `stale` |
+| adjudication | one immutable decision with the version it was based on and the version it created |
+
+A bout is `started` then `completed`, or stays `started` if the path is
+replaced. `is_current = 0` means the bout is replaced history: it is still
+queryable, still shows its result and versions, but **can never advance a
+player again** (the award of a slot to a participant only reads the *current*
+bout of each feeder).
+
+`result_versions` has a partial unique index allowing at most one
+`source='reported'` row per bout, so two staff members can never create two
+effective results for one match. Only an adjudication adds later versions.
+
+### Slot states
+
+`waiting` (feeders have no effective winners yet) · `ready` (both participants
+known and playable) · `suspended` (participants known, but an ancestor result
+is under appeal) · `in_progress` · `completed`. A slot with a live or
+completed current bout keeps displaying it even while an ancestor appeal is
+pending — only *not yet started* affected slots are paused. `participants`
+always reflects the pair of the current bout when there is one
+(`participants_source: "current_match"`), otherwise the pair the current
+effective path would give now (`participants_source: "effective_path"`).
+
+## HTTP
+
+`Idempotency-Key` is required for `start`, `result` and `adjudicate`
+(`appeal` accepts one optionally). Replaying the same key with the same body
+returns the original response; reusing it for a different operation/body is a
+`409 idempotency_conflict`. Missing key is `400`.
+
+| method & path | purpose |
+| --- | --- |
+| `POST /tournaments` | `{name, players: [8 unique names]}` → seeds 1..8 |
+| `GET /tournaments/{id}/bracket` | rounds, slot states, current/history bouts, suspension, champion status |
+| `GET /tournaments/{id}/history` | every bout ever started (with all result versions) and every appeal |
+| `GET /tournaments/{id}/appeals?status=` | appeal ledger |
+| `POST /tournaments/{id}/slots/{slot}/start` | `{started_by}`; locks the two participants |
+| `POST /tournaments/{id}/slots/{slot}/result` | `{winner_player_id, reported_by}`; only for a started, not-yet-completed current bout |
+| `POST /tournaments/{id}/slots/{slot}/appeals` | `{result_version_id, description, submitted_by}` on the **current** effective version |
+| `POST /tournaments/{id}/appeals/{aid}/adjudicate` | `{outcome: "upheld"\|"overturned", expected_result_version_id, adjudicated_by, note?}` |
+| `GET /tournaments/{id}/matches/{mid}` | one bout, current or historical |
+| `GET /health` | liveness |
+
+Errors are `{"error": {"code": ..., "message": ..., ...}}`.
+
+Key codes: `match_already_in_progress`, `match_already_completed`,
+`match_not_started`, `participants_not_ready`, `slot_suspended`,
+`result_version_changed`, `appeal_stale`, `appeal_already_decided`,
+`invalid_winner`, `idempotency_conflict`, `idempotency_key_required`.
+
+## Appeal semantics
+
+* Filing an appeal requires the bout's current effective `result_version_id`;
+  a stale version number is rejected (`result_version_changed`).
+* While pending, the appealed bout keeps showing its result, and every
+  **not yet started** slot downstream of it is `suspended`; `start` returns
+  `409 slot_suspended`. Already started/completed downstream bouts are facts
+  and are untouched. The other half of the bracket is unaffected.
+* No champion is declared while any appeal is pending
+  (`champion_status = {state: "provisional", blocking_appeal_ids: [...]}` and
+  `champion = null`).
+* **Upheld** creates a new version with the same winner (a deliberate "result
+  confirmed" record). Nothing is renamed; paused slots become playable again.
+* **Overturned** creates a new version with the opponent as winner and retires
+  each downstream current bout whose locked pair no longer matches the pair
+  produced by the new path (bouts whose pair is unchanged are left alone).
+  Those retired bouts, including any result or live state, stay in
+  `history`/`superseded_matches` and can never advance anyone. Their slots go
+  back to `ready`/`waiting` and a fresh bout starts later as attempt 2, 3, …
+* Each adjudication makes every other pending appeal **on the old version**
+  stale (`another_appeal_adjudicated`), and every pending appeal whose bout
+  was just superseded stale
+  (`result_superseded_by_upstream_adjudication`). Stale appeals no longer
+  freeze anything and cannot be adjudicated.
+* Adjudication checks that `expected_result_version_id` is still the effective
+  version inside a serialized write transaction. Two opposing decisions
+  therefore cannot both apply: the loser gets `409`. Repeating the *same*
+  decision for the *same* appeal and base version returns the original
+  response unchanged (no new version row).
+
+## Verification
+
+```
+tests/test_bracket.py       seeds, start/result rules, idempotency, restart
+tests/test_appeals.py       suspend/uphold/overturn, history, untouched half,
+                            version targeting, stale appeals, nested appeals
+tests/test_robustness.py    replaced live bouts, races through HTTP, nested
+                            overturn chains, durability
+tests/test_concurrency_db.py  independent connections: one result wins,
+                            one of two opposite adjudications wins
+```
+
+The demo script prints, at each stage, the champion status and per-slot
+`current`/`participants`/`history`/`pending_appeals` so the effect on SF1, the
+final, and the untouched SF2 is directly visible.
